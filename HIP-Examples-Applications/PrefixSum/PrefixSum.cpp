@@ -219,60 +219,6 @@ class PrefixSum
         int runGlobalKernel(unsigned int offset);
 };
 
-__global__
-void group_prefixSum( float * output,
-		      float * input,
-		      const unsigned int length,
-		      const unsigned int idxOffset) {
-	int localId = hipThreadIdx_x;
-	int localSize = hipBlockDim_x;
-	int globalIdx = hipBlockIdx_x;
-	__shared__  float  block[64];
-
-	// Cache the computational window in shared memory
-	globalIdx = (idxOffset *(2 *(globalIdx*localSize + localId) +1)) - 1;
-	if(globalIdx < length)             { block[2*localId]     = input[globalIdx];				}
-    if(globalIdx + idxOffset < length) { block[2*localId + 1] = input[globalIdx + idxOffset];	}
-
-	// Build up tree
-	int offset = 1;
-	for(int l = length>>1; l > 0; l >>= 1)
-	{
-	  __syncthreads();
-	  if(localId < l) {
-            int ai = offset*(2*localId + 1) - 1;
-            int bi = offset*(2*localId + 2) - 1;
-            block[bi] += block[ai];
-         }
-         offset <<= 1;
-	}
-
-	if (length > 2)
-	{
-		if(offset < length) { offset <<= 1; }
-
-		// Build down tree
-		int maxThread = offset>>1;
-		for(int d = 0; d < maxThread; d<<=1)
-		{
-			d += 1;
-			offset >>=1;
-	                __syncthreads();
-
-			if(localId < d) {
-				int ai = offset*(localId + 1) - 1;
-				int bi = ai + (offset>>1);
-				block[bi] += block[ai];
-			}
-		}
-	}
-	  __syncthreads();
-
-    // write the results back to global memory
-    if(globalIdx < length)           { output[globalIdx]             = block[2*localId];		}
-    if(globalIdx+idxOffset < length) { output[globalIdx + idxOffset] = block[2*localId + 1];	}
-}
-
 /*
  * Work-efficient compute implementation of scan, one thread per 2 elements
  * O(log(n)) stepas and O(n) adds using shared memory
@@ -283,21 +229,32 @@ void group_prefixSum( float * output,
  * @param length	lenght of the input data
  */
 __global__
-void global_prefixSum( 
-		       float * buffer,
-                       unsigned int offset,
-		       unsigned int length) {
-	int localSize = hipBlockDim_x;
-    int groupIdx  = hipBlockIdx_x;
+void prefixSumDpp(float* input, float* output, unsigned int length)
+{
+    int element = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;
+    if (element < length)
+    {
+        float out = 0;
 
-	int sortedLocalBlocks = offset / localSize;		// sorted groups per block
-	// Map the gids to unsorted local blocks.
-	int gidToUnsortedBlocks = groupIdx + (groupIdx / ((offset<<1) - sortedLocalBlocks) +1) * sortedLocalBlocks;
+        asm volatile("v_add_f32 \%0, \%1, \%1 row_shr:1 bound_ctrl:0 \n"
+            "v_add_f32 \%0, \%1, \%0 row_shr:2 bound_ctrl:0 \n"
+            "v_add_f32 \%0, \%1, \%0 row_shr:3 bound_ctrl:0 \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "v_add_f32 \%0, \%0, \%0 row_shr:4 bank_mask:0xe \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "v_add_f32 \%0, \%0, \%0 row_shr:8 bank_mask:0xc \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "v_add_f32 \%0, \%0, \%0 row_bcast:15 row_mask:0xa \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "s_nop 0 // Nop required for data hazard in SP \n"
+            "v_add_f32 \%0, \%0, \%0 row_bcast:31 row_mask:0xc \n"
+            : "={v1}"(out) : "{v0}"(input[element]));
 
-	// Get the corresponding global index
-    int globalIdx = (gidToUnsortedBlocks*localSize + hipThreadIdx_x);
-	if(((globalIdx+1) % offset != 0) && (globalIdx < length))
-		buffer[globalIdx] += buffer[globalIdx - (globalIdx%offset + 1)];
+        output[element] = out;
+    }
 }
 
 
@@ -335,53 +292,6 @@ int PrefixSum::setupPrefixSum()
 int
 PrefixSum::setupHIP(void)
 {
-
-    return SDK_SUCCESS;
-}
-
-int
-PrefixSum::runGroupKernel(unsigned int offset)
-{
-
-    float* buf;
-    unsigned int dataSize = length/offset;
-    unsigned int localThreads = 128;
-    unsigned int globalThreads = (dataSize+1) / 2;    // Actual threads needed
-    // Set global thread size multiple of local thread size.
-    globalThreads = ((globalThreads + localThreads - 1) / localThreads) *
-                    localThreads;
-
-buf=(offset>1) ? outputBuffer  : inputBuffer;
-hipLaunchKernelGGL(group_prefixSum,
-                  dim3(globalThreads/localThreads),
-                  dim3(localThreads),
-                  0, 0,
-                  outputBuffer ,buf,length,offset);
-
-
-    return SDK_SUCCESS;
-}
-
-int
-PrefixSum::runGlobalKernel(unsigned int offset)
-{
-    unsigned int localThreads = 128;
-    unsigned int localDataSize = localThreads << 1;   // Each thread work on 2 elements
-
-    // Set number of threads needed for global_kernel.
-    unsigned int globalThreads = length - offset;
-    globalThreads -= (globalThreads / (offset * localDataSize)) * offset;
-
-    // Set global thread size multiple of local thread size.
-    globalThreads = ((globalThreads + localThreads - 1) / localThreads) *
-                    localThreads;
-
-hipLaunchKernelGGL(global_prefixSum,
-                  dim3(globalThreads/localThreads),
-                  dim3(localThreads),
-                  0, 0,
-                  outputBuffer ,offset, length);
-
     return SDK_SUCCESS;
 }
 
@@ -389,29 +299,12 @@ int
 PrefixSum::runKernels(void)
 {
     hipMemcpy(din, input, sizeof(float) * length, hipMemcpyHostToDevice);
-    unsigned int localThreads = 128;
-    unsigned int localDataSize = localThreads << 1;   // Each thread work on 2 elements
 
-
-    for(unsigned int offset=1; offset<length; offset *= localDataSize)
-    {
-        if ((length/offset) > 1)  // Need atlest 2 element for process the kernel
-        {
-            if(runGroupKernel(offset) != SDK_SUCCESS)
-            {
-                return SDK_FAILURE;
-            }
-        }
-
-        // Call global_kernel for update all elements
-        if(offset > 1)
-        {
-            if(runGlobalKernel(offset) != SDK_SUCCESS)
-            {
-                return SDK_FAILURE;
-            }
-        }
-    }
+    hipLaunchKernelGGL(prefixSumDpp,
+                  dim3(length),
+                  dim3(64),
+                  0, 0,
+                  inputBuffer, outputBuffer, length);
 
     return SDK_SUCCESS;
 }
@@ -422,11 +315,14 @@ PrefixSum::prefixSumCPUReference(
     float * input,
     const unsigned int length)
 {
-    output[0] = input[0];
-
-    for(unsigned int i = 1; i< length; ++i)
+    unsigned int numGroups =  length / 64 + (length % 64 != 0);
+    for (unsigned int grp = 0; grp < numGroups; ++grp)
     {
-        output[i] = input[i] + output[i-1];
+        output[grp * 64] = input[grp * 64];
+        for (unsigned int item = 1; item < 64 && grp * 64 + item < length; item++)
+        {
+            output[grp * 64 + item] = input[grp * 64 + item] + output[grp * 64 + item - 1];
+        }
     }
 }
 
@@ -555,14 +451,12 @@ int PrefixSum::verifyResults()
         else
         {
             std::cout << "Failed\n" << std::endl;
+            if(!sampleArgs->quiet)
+            {
+                printArray<float>("Expected : ", verificationOutput, length, 1);
+            }
             status = SDK_FAILURE;
         }
-
-        if(!sampleArgs->quiet)
-        {
-            printArray<float>("Output : ", out, length, 1);
-        }
-
     }
     return status;
 }
@@ -650,4 +544,3 @@ main(int argc, char * argv[])
     hipPrefixSum.printStats();
     return SDK_SUCCESS;
 }
-
